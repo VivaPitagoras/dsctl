@@ -56,6 +56,7 @@ dsctl <service|*> <action>
 | edit     | dsctl \<service> edit    | Open the compose file in the configured editor. |
 | env      | dsctl \<service> env     | Open or create a `.env` file for the service in the editor. |
 | cd       | dsctl \<service> cd      | Change directory to the service folder. |
+| ls       | dsctl \<services> ls     | List files and folders under <service> folder |
 
 ---
 
