@@ -25,7 +25,7 @@ MAX_DS_JOBS="${MAX_DS_JOBS:-4}"
 # Command definitions
 # ------------------------------
 GLOBAL_COMMANDS="help list clean dry-clean command-conflict"
-SINGLE_ACTIONS="new del up down reload update edit env cd"
+SINGLE_ACTIONS="new del up down reload update edit env cd ls"
 GROUP_ACTIONS="up down reload update"
 
 # ------------------------------
@@ -156,7 +156,7 @@ dsctl() {
     case "$action" in
         help)
             echo "Single target:"
-            echo "  dsctl <service> {new|del|up|down|reload|update|edit|env|cd}"
+            echo "  dsctl <service> {new|del|up|down|reload|update|edit|env|cd|ls}"
             echo
             echo "Group target:"
             echo "  dsctl {all|a} {up|down|reload|update}"
@@ -238,6 +238,16 @@ dsctl() {
         cd)
             [ "$target" = "ALL" ] && { echo "cd is single-target only"; return; }
             cd "$SERVICES_DIR/$target" || return
+            ;;
+        ls)
+            [ "$target" = "ALL" ] && { echo "ls is single-target only"; return; }
+            local svc_dir="$SERVICES_DIR/$target"
+            if [ ! -d "$svc_dir" ]; then
+                echo "Service folder '$target' does not exist."
+                return
+            fi
+            echo "Contents of $svc_dir:"
+            ls -lah "$svc_dir"
             ;;
         new)
             [ "$target" = "ALL" ] && { echo "new is single-target only"; return; }
