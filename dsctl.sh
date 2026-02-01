@@ -60,22 +60,26 @@ _list_services() {
     done
 }
 
-_service_status() {
+# ------------------------------
+# Robust service state detection
+# ------------------------------
+get_service_state() {
     local svc="$1"
-    local dir="$SERVICES_DIR/$svc"
 
-    if ! _is_stack "$dir"; then
-        echo -e "${CLR_GRAY}non-stack${CLR_RESET}"
+    # Check running containers (prefix match)
+    if docker ps --format '{{.Names}}' | grep -Eq "^${svc}($|[_-])"; then
+        echo -e "${CLR_GREEN}running${CLR_RESET}"
         return
     fi
 
-    if docker ps --format '{{.Names}}' | grep -q "^${svc}_"; then
-        echo -e "${CLR_GREEN}running${CLR_RESET}"
-    elif docker ps -a --format '{{.Names}}' | grep -q "^${svc}_"; then
+    # Check stopped containers (prefix match)
+    if docker ps -a --format '{{.Names}}' | grep -Eq "^${svc}($|[_-])"; then
         echo -e "${CLR_RED}stopped${CLR_RESET}"
-    else
-        echo -e "${CLR_YELLOW}down${CLR_RESET}"
+        return
     fi
+
+    # No containers found
+    echo -e "${CLR_YELLOW}down${CLR_RESET}"
 }
 
 _run_parallel() {
@@ -166,7 +170,7 @@ dsctl() {
             ;;
         list)
             for svc in $(_list_services); do
-                printf " - %-20s [%b]\n" "$svc" "$(_service_status "$svc")"
+                printf " - %-20s [%b]\n" "$svc" "$(get_service_state "$svc")"
             done
             return
             ;;
