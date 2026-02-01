@@ -49,9 +49,16 @@ _run_parallel() { local cmd="$1"; shift; local jobs=0; for svc in "$@"; do (
 # Main command: dsctl
 # ==============================
 dsctl() {
-	local target="$1" action="$2"
-	[ -z "$target" ] && action="help"
-	[ "$target" = "*" ] && target="ALL"
+    local raw_target="$1"
+    local action="$2"
+    local target services
+
+    # Normalize target: only 'all' or 'a' allowed for group actions
+    case "$raw_target" in
+        all|a) target="ALL" ;;
+        "")    action="help" ;;
+        *)     target="$raw_target" ;;
+    esac
 
 	# Actions that don't require a single service
 	case "$action" in
@@ -68,7 +75,7 @@ dsctl() {
 			echo "     - edit"
 			echo "     - env"
 			echo "     - cd"
-			echo "\n2. Group target commands: dsctl * <action>"
+			echo "\n2. Group target commands: dsctl [all|a] <action>"
 			echo "   Actions:"
 			echo "     - up"
 			echo "     - down"
