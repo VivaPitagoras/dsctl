@@ -135,7 +135,7 @@ dsctl romm edit
 ## Usage
 
 ```sh
-dsctl <service|*> <action>
+dsctl <service|a> <action>
 ```
 
 ### 1. Single target commands
