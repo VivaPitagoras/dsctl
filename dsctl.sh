@@ -32,24 +32,9 @@ CLR_YELLOW="\033[0;33m"
 # ------------------------------
 # Helpers
 # ------------------------------
-_in_list() {
-    local w="$1"; shift
-    for i in "$@"; do
-        [ "$i" = "$w" ] && return 0
-    done
-    return 1
-}
-
+_in_list() { local w="$1"; shift; for i in "$@"; do [ "$i" = "$w" ] && return 0; done; return 1; }
 _is_stack() { [ -f "$1/$COMPOSE_FILE" ]; }
-
-_list_services() {
-    [ -d "$SERVICES_DIR" ] || return
-    for d in "$SERVICES_DIR"/*; do
-        [ -d "$d" ] || continue
-        basename "$d"
-    done
-}
-
+_list_services() { [ -d "$SERVICES_DIR" ] || return; for d in "$SERVICES_DIR"/*; do [ -d "$d" ] || continue; basename "$d"; done; }
 _get_docker_compose_cmd() {
     if docker compose version >/dev/null 2>&1; then
         echo "docker compose"
@@ -60,56 +45,39 @@ _get_docker_compose_cmd() {
     fi
 }
 
+# ------------------------------
+# Service state detection
+# ------------------------------
 get_service_state() {
     local svc="$1"
     local cmd=$(_get_docker_compose_cmd)
-
     [ -z "$cmd" ] && echo -e "${CLR_YELLOW}missing${CLR_RESET}" && return
 
-    if $cmd ps --format '{{.Name}}' 2>/dev/null | grep -Eq "^${svc}"; then
+    cd "$SERVICES_DIR/$svc" 2>/dev/null || { echo -e "${CLR_YELLOW}down${CLR_RESET}"; return; }
+
+    local running_count stopped_count
+    running_count=$($cmd ps --filter "status=running" --format '{{.Name}}' 2>/dev/null | wc -l)
+    stopped_count=$($cmd ps --filter "status=exited" --format '{{.Name}}' 2>/dev/null | wc -l)
+
+    if [ "$running_count" -gt 0 ]; then
         echo -e "${CLR_GREEN}running${CLR_RESET}"
-        return
-    fi
-
-    if $cmd ps -a --format '{{.Name}}' 2>/dev/null | grep -Eq "^${svc}"; then
+    elif [ "$stopped_count" -gt 0 ]; then
         echo -e "${CLR_RED}stopped${CLR_RESET}"
-        return
+    else
+        echo -e "${CLR_YELLOW}down${CLR_RESET}"
     fi
-
-    echo -e "${CLR_YELLOW}down${CLR_RESET}"
 }
 
 # ------------------------------
 # Docker Compose wrappers
 # ------------------------------
-_dc_up() {
-    local svc="$1"
-    local cmd=$(_get_docker_compose_cmd)
-    cd "$SERVICES_DIR/$svc" || return 1
-    $cmd up -d
-}
-
-_dc_down() {
-    local svc="$1"
-    local cmd=$(_get_docker_compose_cmd)
-    cd "$SERVICES_DIR/$svc" || return 1
-    $cmd down
-}
-
-_dc_reload() {
-    local svc="$1"
-    _dc_down "$svc" && _dc_up "$svc"
-}
-
-_dc_update() {
-    local svc="$1"
-    local cmd=$(_get_docker_compose_cmd)
-    cd "$SERVICES_DIR/$svc" || return 1
-    $cmd pull && $cmd up -d
-}
+_dc_up() { local svc="$1"; local cmd=$(_get_docker_compose_cmd); cd "$SERVICES_DIR/$svc" || return 1; $cmd up -d; }
+_dc_down() { local svc="$1"; local cmd=$(_get_docker_compose_cmd); cd "$SERVICES_DIR/$svc" || return 1; $cmd down; }
+_dc_reload() { local svc="$1"; _dc_down "$svc" && _dc_up "$svc"; }
+_dc_update() { local svc="$1"; local cmd=$(_get_docker_compose_cmd); cd "$SERVICES_DIR/$svc" || return 1; $cmd pull && $cmd up -d; }
 
 # ------------------------------
-# Parallel Execution
+# Parallel execution (helper)
 # ------------------------------
 _run_parallel() {
     local cmd="$1"; shift
@@ -144,18 +112,11 @@ _ds_alias_persistent() {
     local action="$1"
     local alias_file="$HOME/.bash_aliases"
     touch "$alias_file"
-
     case "$action" in
         off)
             local existing
             existing=$(grep -E '^alias .*?=dsctl$' "$alias_file" | awk -F'=' '{print $1}' | sed 's/alias //')
-            if [ -n "$existing" ]; then
-                sed -i "/^alias $existing=.*$/d" "$alias_file"
-                unalias "$existing" 2>/dev/null
-                echo "Alias removed: $existing"
-            else
-                echo "No alias found."
-            fi
+            [ -n "$existing" ] && sed -i "/^alias $existing=.*$/d" "$alias_file" && unalias "$existing" 2>/dev/null && echo "Alias removed: $existing" || echo "No alias found."
             ;;
         status)
             grep -E '^alias .*?=dsctl$' "$alias_file" || echo "No persistent alias set."
@@ -190,15 +151,8 @@ _dsctl_completion() {
     fi
 }
 
-if [ -n "$BASH_VERSION" ]; then
-    complete -F _dsctl_completion dsctl 2>/dev/null
-fi
-
-if [ -n "$ZSH_VERSION" ]; then
-    autoload -Uz compinit
-    compinit
-    compdef _dsctl_completion dsctl
-fi
+[ -n "$BASH_VERSION" ] && complete -F _dsctl_completion dsctl 2>/dev/null
+[ -n "$ZSH_VERSION" ] && { autoload -Uz compinit; compinit; compdef _dsctl_completion dsctl; }
 
 # ------------------------------
 # Installer
@@ -223,15 +177,7 @@ _dsctl_install() {
     fi
 
     echo -e "\n✅ Installed successfully!"
-    if [[ "${BASH_SOURCE[0]}" != "$0" ]]; then
-        echo "✨ Sourced install → activating now..."
-        source "$shell_rc"
-        echo "dsctl is now active."
-    else
-        echo "Run this to activate:"
-        echo "  source $shell_rc"
-        echo "or open a new terminal."
-    fi
+    [[ "${BASH_SOURCE[0]}" != "$0" ]] && source "$shell_rc"
 }
 
 # ------------------------------
@@ -243,11 +189,11 @@ dsctl() {
     local arg2="$2"
     local target action services
 
-    if [ "$arg1" = "install" ]; then _dsctl_install; return; fi
-    if [ "$arg1" = "alias" ]; then _ds_alias_persistent "$arg2"; return; fi
+    [ "$arg1" = "install" ] && { _dsctl_install; return; }
+    [ "$arg1" = "alias" ] && { _ds_alias_persistent "$arg2"; return; }
 
-    if [ "$argc" -eq 1 ]; then action="$arg1"; fi
-    if [ "$argc" -eq 2 ]; then target="$arg1"; action="$arg2"; fi
+    [ "$argc" -eq 1 ] && action="$arg1"
+    [ "$argc" -eq 2 ] && { target="$arg1"; action="$arg2"; }
     [ "$argc" -eq 0 ] && action="help"
 
     case "$action" in
@@ -272,22 +218,63 @@ dsctl() {
             ;;
         dry-clean)
             echo "Non-stack folders:"
-            for d in "$SERVICES_DIR"/*; do
-                [ -d "$d" ] || continue
-                _is_stack "$d" || echo " - $(basename "$d")"
-            done; return
+            for d in "$SERVICES_DIR"/*; do [ -d "$d" ] || continue; _is_stack "$d" || echo " - $(basename "$d")"; done
+            return
             ;;
         clean)
-            for d in "$SERVICES_DIR"/*; do
-                [ -d "$d" ] || continue
-                _is_stack "$d" || rm -rf "$d"
-            done
+            for d in "$SERVICES_DIR"/*; do [ -d "$d" ] || continue; _is_stack "$d" || rm -rf "$d"; done
             echo "Cleaned."; return
             ;;
     esac
 
+    # Target determination
     [ "$target" = "all" ] || [ "$target" = "a" ] && services=$(_list_services) || services="$target"
 
+    # ------------------------------
+    # Show before/after table for all actions
+    # ------------------------------
+    if _in_list "$action" up down reload update && [ "$target" = "all" ] || [ "$target" = "a" ]; then
+        declare -A BEFORE
+        declare -A AFTER
+        # Capture before states
+        for svc in $services; do
+            BEFORE["$svc"]=$(get_service_state "$svc" | sed "s/\x1b\[[0-9;]*m//g")
+        done
+
+        # Run the action
+        case "$action" in
+            up) _run_parallel "_dc_up" $services ;;
+            down) _run_parallel "_dc_down" $services ;;
+            reload) _run_parallel "_dc_reload" $services ;;
+            update) _run_parallel "_dc_update" $services ;;
+        esac
+
+        # Capture after states
+        for svc in $services; do
+            AFTER["$svc"]=$(get_service_state "$svc" | sed "s/\x1b\[[0-9;]*m//g")
+        done
+
+        # Print table
+        printf "\n%-22s %-12s %-12s\n" "SERVICE" "BEFORE" "AFTER"
+        printf "%-22s %-12s %-12s\n" "----------------------" "---------" "---------"
+        for svc in $services; do
+            # color-code after state
+            local state_after
+            case "${AFTER[$svc]}" in
+                running) state_after="${CLR_GREEN}running${CLR_RESET}" ;;
+                stopped) state_after="${CLR_RED}stopped${CLR_RESET}" ;;
+                down) state_after="${CLR_YELLOW}down${CLR_RESET}" ;;
+                *) state_after="${AFTER[$svc]}" ;;
+            esac
+            printf "%-22s %-12s %-12b\n" "$svc" "${BEFORE[$svc]}" "$state_after"
+        done
+        echo ""
+        return
+    fi
+
+    # ------------------------------
+    # Single service actions
+    # ------------------------------
     case "$action" in
         up) _run_parallel "_dc_up" $services ;;
         down) _run_parallel "_dc_down" $services ;;
@@ -304,12 +291,7 @@ dsctl() {
             [ ! -d "$SERVICES_DIR/$target" ] && { echo "Service '$target' not found."; return; }
             echo -e "${CLR_RED}⚠ WARNING:${CLR_RESET} This will permanently delete: $SERVICES_DIR/$target"
             read -r -p "Type '$target' to confirm deletion: " confirm
-            if [ "$confirm" = "$target" ]; then
-                rm -rf "$SERVICES_DIR/$target"
-                echo -e "[${CLR_GREEN}$target${CLR_RESET}] ✅ deleted"
-            else
-                echo "Cancelled."
-            fi
+            [ "$confirm" = "$target" ] && { rm -rf "$SERVICES_DIR/$target"; echo -e "[${CLR_GREEN}$target${CLR_RESET}] ✅ deleted"; } || echo "Cancelled."
             ;;
         *)
             echo "Unknown action: $action"
@@ -320,6 +302,4 @@ dsctl() {
 # ------------------------------
 # AUTO-RUN ONLY IF EXECUTED DIRECTLY
 # ------------------------------
-if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
-    dsctl "$@"
-fi
+[[ "${BASH_SOURCE[0]}" == "$0" ]] && dsctl "$@"
