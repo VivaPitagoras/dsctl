@@ -46,26 +46,32 @@ _get_docker_compose_cmd() {
 }
 
 # ------------------------------
-# Service state detection
+# Get service state
 # ------------------------------
-get_service_state() {
+_get_service_state_parallel() {
     local svc="$1"
     local cmd=$(_get_docker_compose_cmd)
     [ -z "$cmd" ] && echo -e "${CLR_YELLOW}missing${CLR_RESET}" && return
 
-    cd "$SERVICES_DIR/$svc" 2>/dev/null || { echo -e "${CLR_YELLOW}down${CLR_RESET}"; return; }
-
-    local running_count stopped_count
-    running_count=$($cmd ps --filter "status=running" --format '{{.Name}}' 2>/dev/null | wc -l)
-    stopped_count=$($cmd ps --filter "status=exited" --format '{{.Name}}' 2>/dev/null | wc -l)
-
-    if [ "$running_count" -gt 0 ]; then
-        echo -e "${CLR_GREEN}running${CLR_RESET}"
-    elif [ "$stopped_count" -gt 0 ]; then
-        echo -e "${CLR_RED}stopped${CLR_RESET}"
-    else
+    if [ ! -f "$SERVICES_DIR/$svc/$COMPOSE_FILE" ]; then
         echo -e "${CLR_YELLOW}down${CLR_RESET}"
+        return
     fi
+
+    (
+        cd "$SERVICES_DIR/$svc" 2>/dev/null || exit 1
+        local running_count stopped_count
+        running_count=$($cmd ps --filter "status=running" --format '{{.Name}}' 2>/dev/null | wc -l)
+        stopped_count=$($cmd ps --filter "status=exited" --format '{{.Name}}' 2>/dev/null | wc -l)
+
+        if [ "$running_count" -gt 0 ]; then
+            echo -e "${CLR_GREEN}running${CLR_RESET}"
+        elif [ "$stopped_count" -gt 0 ]; then
+            echo -e "${CLR_RED}stopped${CLR_RESET}"
+        else
+            echo -e "${CLR_YELLOW}down${CLR_RESET}"
+        fi
+    )
 }
 
 # ------------------------------
@@ -77,31 +83,53 @@ _dc_reload() { local svc="$1"; _dc_down "$svc" && _dc_up "$svc"; }
 _dc_update() { local svc="$1"; local cmd=$(_get_docker_compose_cmd); cd "$SERVICES_DIR/$svc" || return 1; $cmd pull && $cmd up -d; }
 
 # ------------------------------
-# Parallel execution (helper)
+# Parallel execution helper
 # ------------------------------
-_run_parallel() {
+_run_parallel_live() {
     local cmd="$1"; shift
-    local jobs=0
-    declare -A results
+    local services=("$@")
+    declare -A BEFORE AFTER
+    declare -A PIDS
 
-    for svc in "$@"; do
+    # Capture BEFORE states
+    for svc in "${services[@]}"; do
+        BEFORE["$svc"]=$(_get_service_state_parallel "$svc" | sed "s/\x1b\[[0-9;]*m//g")
+        AFTER["$svc"]="${BEFORE[$svc]}"
+    done
+
+    # Launch jobs
+    for svc in "${services[@]}"; do
         (
             eval "$cmd \"$svc\""
         ) &
-        results[$!]="$svc"
-        jobs=$((jobs + 1))
-        [ "$jobs" -ge "$MAX_DS_JOBS" ] && wait && jobs=0
+        PIDS[$!]="$svc"
     done
 
-    for pid in "${!results[@]}"; do
-        wait "$pid"
-        local exit_code=$?
-        local svc="${results[$pid]}"
-        if [ "$exit_code" -eq 0 ]; then
-            echo -e "[${CLR_GREEN}$svc${CLR_RESET}] ✅ success"
-        else
-            echo -e "[${CLR_RED}$svc${CLR_RESET}] ❌ failed"
-        fi
+    # Live table
+    while [ "${#PIDS[@]}" -gt 0 ]; do
+        for pid in "${!PIDS[@]}"; do
+            svc="${PIDS[$pid]}"
+            if ! kill -0 "$pid" 2>/dev/null; then
+                wait "$pid"
+                AFTER["$svc"]=$(_get_service_state_parallel "$svc" | sed "s/\x1b\[[0-9;]*m//g")
+                unset PIDS[$pid]
+            fi
+        done
+        # Clear and redraw
+        printf "\033[H\033[2J"  # clear screen
+        printf "%-22s %-12s %-12s\n" "SERVICE" "BEFORE" "AFTER"
+        printf "%-22s %-12s %-12s\n" "----------------------" "---------" "---------"
+        for svc in "${services[@]}"; do
+            local after_color
+            case "${AFTER[$svc]}" in
+                running) after_color="${CLR_GREEN}running${CLR_RESET}" ;;
+                stopped) after_color="${CLR_RED}stopped${CLR_RESET}" ;;
+                down) after_color="${CLR_YELLOW}down${CLR_RESET}" ;;
+                *) after_color="${AFTER[$svc]}" ;;
+            esac
+            printf "%-22s %-12s %-12b\n" "$svc" "${BEFORE[$svc]}" "$after_color"
+        done
+        sleep 0.3
     done
 }
 
@@ -208,13 +236,26 @@ dsctl() {
             return
             ;;
         list)
+            local services=($(_list_services))
+            declare -A STATE
+            # parallel
+            for svc in "${services[@]}"; do
+                _get_service_state_parallel "$svc" &
+                STATE["$svc"]=$!
+            done
+            # wait and collect
+            for svc in "${services[@]}"; do
+                wait "${STATE[$svc]}"
+                STATE["$svc"]=$(_get_service_state_parallel "$svc")
+            done
+
             printf "\n%-22s %-12s\n" "SERVICE" "STATE"
             printf "%-22s %-12s\n" "----------------------" "------------"
-            for svc in $(_list_services); do
-                state=$(get_service_state "$svc")
-                printf "%-22s %-12b\n" "$svc" "$state"
+            for svc in "${services[@]}"; do
+                printf "%-22s %-12b\n" "$svc" "${STATE[$svc]}"
             done
-            echo ""; return
+            echo ""
+            return
             ;;
         dry-clean)
             echo "Non-stack folders:"
@@ -227,48 +268,18 @@ dsctl() {
             ;;
     esac
 
-    # Target determination
     [ "$target" = "all" ] || [ "$target" = "a" ] && services=$(_list_services) || services="$target"
 
     # ------------------------------
-    # Show before/after table for all actions
+    # All-stack actions with live table
     # ------------------------------
-    if _in_list "$action" up down reload update && [ "$target" = "all" ] || [ "$target" = "a" ]; then
-        declare -A BEFORE
-        declare -A AFTER
-        # Capture before states
-        for svc in $services; do
-            BEFORE["$svc"]=$(get_service_state "$svc" | sed "s/\x1b\[[0-9;]*m//g")
-        done
-
-        # Run the action
+    if _in_list "$action" up down reload update && ([ "$target" = "all" ] || [ "$target" = "a" ]); then
         case "$action" in
-            up) _run_parallel "_dc_up" $services ;;
-            down) _run_parallel "_dc_down" $services ;;
-            reload) _run_parallel "_dc_reload" $services ;;
-            update) _run_parallel "_dc_update" $services ;;
+            up) _run_parallel_live "_dc_up" $services ;;
+            down) _run_parallel_live "_dc_down" $services ;;
+            reload) _run_parallel_live "_dc_reload" $services ;;
+            update) _run_parallel_live "_dc_update" $services ;;
         esac
-
-        # Capture after states
-        for svc in $services; do
-            AFTER["$svc"]=$(get_service_state "$svc" | sed "s/\x1b\[[0-9;]*m//g")
-        done
-
-        # Print table
-        printf "\n%-22s %-12s %-12s\n" "SERVICE" "BEFORE" "AFTER"
-        printf "%-22s %-12s %-12s\n" "----------------------" "---------" "---------"
-        for svc in $services; do
-            # color-code after state
-            local state_after
-            case "${AFTER[$svc]}" in
-                running) state_after="${CLR_GREEN}running${CLR_RESET}" ;;
-                stopped) state_after="${CLR_RED}stopped${CLR_RESET}" ;;
-                down) state_after="${CLR_YELLOW}down${CLR_RESET}" ;;
-                *) state_after="${AFTER[$svc]}" ;;
-            esac
-            printf "%-22s %-12s %-12b\n" "$svc" "${BEFORE[$svc]}" "$state_after"
-        done
-        echo ""
         return
     fi
 
@@ -280,7 +291,6 @@ dsctl() {
         down) _run_parallel "_dc_down" $services ;;
         reload) _run_parallel "_dc_reload" $services ;;
         update) _run_parallel "_dc_update" $services ;;
-
         edit) $EDITOR "$SERVICES_DIR/$target/$COMPOSE_FILE" ;;
         env) $EDITOR "$SERVICES_DIR/$target/.env" ;;
         cd) cd "$SERVICES_DIR/$target" || return ;;
@@ -293,13 +303,11 @@ dsctl() {
             read -r -p "Type '$target' to confirm deletion: " confirm
             [ "$confirm" = "$target" ] && { rm -rf "$SERVICES_DIR/$target"; echo -e "[${CLR_GREEN}$target${CLR_RESET}] ✅ deleted"; } || echo "Cancelled."
             ;;
-        *)
-            echo "Unknown action: $action"
-            ;;
+        *) echo "Unknown action: $action" ;;
     esac
 }
 
 # ------------------------------
-# AUTO-RUN ONLY IF EXECUTED DIRECTLY
+# Auto-run if executed directly
 # ------------------------------
 [[ "${BASH_SOURCE[0]}" == "$0" ]] && dsctl "$@"
