@@ -30,19 +30,46 @@ CLR_RED="\033[0;31m"
 CLR_YELLOW="\033[0;33m"
 
 # ------------------------------
+# Detect Docker Compose once
+# ------------------------------
+DOCKER_COMPOSE_CMD=""
+if docker compose version >/dev/null 2>&1; then
+    DOCKER_COMPOSE_CMD="docker compose"
+elif docker-compose version >/dev/null 2>&1; then
+    DOCKER_COMPOSE_CMD="docker-compose"
+else
+    echo "Error: docker-compose not found"
+    exit 1
+fi
+
+# ------------------------------
 # Helpers
 # ------------------------------
 _in_list() { local w="$1"; shift; for i in "$@"; do [ "$i" = "$w" ] && return 0; done; return 1; }
 _is_stack() { [ -f "$1/$COMPOSE_FILE" ]; }
 _list_services() { [ -d "$SERVICES_DIR" ] || return; for d in "$SERVICES_DIR"/*; do [ -d "$d" ] || continue; basename "$d"; done; }
-_get_docker_compose_cmd() {
-    if docker compose version >/dev/null 2>&1; then
-        echo "docker compose"
-    elif docker-compose version >/dev/null 2>&1; then
-        echo "docker-compose"
-    else
-        echo ""
-    fi
+_colorize_state() {
+    case "$1" in
+        running) echo -e "${CLR_GREEN}running${CLR_RESET}" ;;
+        stopped) echo -e "${CLR_RED}stopped${CLR_RESET}" ;;
+        down) echo -e "${CLR_YELLOW}down${CLR_RESET}" ;;
+        *) echo "$1" ;;
+    esac
+}
+
+# ------------------------------
+# Docker Compose wrapper
+# ------------------------------
+_dc_exec() {
+    local svc="$1"
+    local action="$2"
+    cd "$SERVICES_DIR/$svc" || { echo "[${CLR_RED}$svc${CLR_RESET}] ❌ cannot enter directory"; return 1; }
+    case "$action" in
+        up) $DOCKER_COMPOSE_CMD up -d ;;
+        down) $DOCKER_COMPOSE_CMD down ;;
+        reload) $DOCKER_COMPOSE_CMD down && $DOCKER_COMPOSE_CMD up -d ;;
+        update) $DOCKER_COMPOSE_CMD pull && $DOCKER_COMPOSE_CMD up -d ;;
+    esac
 }
 
 # ------------------------------
@@ -50,91 +77,51 @@ _get_docker_compose_cmd() {
 # ------------------------------
 _get_service_state_parallel() {
     local svc="$1"
-    local cmd=$(_get_docker_compose_cmd)
-    [ -z "$cmd" ] && echo -e "${CLR_YELLOW}missing${CLR_RESET}" && return
-
     if [ ! -f "$SERVICES_DIR/$svc/$COMPOSE_FILE" ]; then
-        echo -e "${CLR_YELLOW}down${CLR_RESET}"
+        echo "down"
         return
     fi
-
-    (
-        cd "$SERVICES_DIR/$svc" 2>/dev/null || exit 1
-        local running_count stopped_count
-        running_count=$($cmd ps --filter "status=running" --format '{{.Name}}' 2>/dev/null | wc -l)
-        stopped_count=$($cmd ps --filter "status=exited" --format '{{.Name}}' 2>/dev/null | wc -l)
-
-        if [ "$running_count" -gt 0 ]; then
-            echo -e "${CLR_GREEN}running${CLR_RESET}"
-        elif [ "$stopped_count" -gt 0 ]; then
-            echo -e "${CLR_RED}stopped${CLR_RESET}"
-        else
-            echo -e "${CLR_YELLOW}down${CLR_RESET}"
-        fi
-    )
+    cd "$SERVICES_DIR/$svc" 2>/dev/null || { echo "down"; return; }
+    local running_count stopped_count
+    running_count=$($DOCKER_COMPOSE_CMD ps --filter "status=running" --format '{{.Name}}' 2>/dev/null | wc -l)
+    stopped_count=$($DOCKER_COMPOSE_CMD ps --filter "status=exited" --format '{{.Name}}' 2>/dev/null | wc -l)
+    if [ "$running_count" -gt 0 ]; then
+        echo "running"
+    elif [ "$stopped_count" -gt 0 ]; then
+        echo "stopped"
+    else
+        echo "down"
+    fi
 }
 
 # ------------------------------
-# Docker Compose wrappers
+# Parallel execution
 # ------------------------------
-_dc_up() { local svc="$1"; local cmd=$(_get_docker_compose_cmd); cd "$SERVICES_DIR/$svc" || return 1; $cmd up -d; }
-_dc_down() { local svc="$1"; local cmd=$(_get_docker_compose_cmd); cd "$SERVICES_DIR/$svc" || return 1; $cmd down; }
-_dc_reload() { local svc="$1"; _dc_down "$svc" && _dc_up "$svc"; }
-_dc_update() { local svc="$1"; local cmd=$(_get_docker_compose_cmd); cd "$SERVICES_DIR/$svc" || return 1; $cmd pull && $cmd up -d; }
-
-# ------------------------------
-# Parallel execution helper
-# ------------------------------
-_run_parallel_live() {
+_run_parallel() {
     local cmd="$1"; shift
-    local services=("$@")
-    declare -A BEFORE AFTER
-    declare -A PIDS
-
-    # Capture BEFORE states
-    for svc in "${services[@]}"; do
-        BEFORE["$svc"]=$(_get_service_state_parallel "$svc" | sed "s/\x1b\[[0-9;]*m//g")
-        AFTER["$svc"]="${BEFORE[$svc]}"
+    local jobs=0
+    local svc exit_code
+    declare -A results
+    for svc in "$@"; do
+        ( eval "$cmd \"$svc\"" ) &
+        results[$!]="$svc"
+        jobs=$((jobs + 1))
+        [ "$jobs" -ge "$MAX_DS_JOBS" ] && wait && jobs=0
     done
-
-    # Launch jobs
-    for svc in "${services[@]}"; do
-        (
-            eval "$cmd \"$svc\""
-        ) &
-        PIDS[$!]="$svc"
-    done
-
-    # Live table
-    while [ "${#PIDS[@]}" -gt 0 ]; do
-        for pid in "${!PIDS[@]}"; do
-            svc="${PIDS[$pid]}"
-            if ! kill -0 "$pid" 2>/dev/null; then
-                wait "$pid"
-                AFTER["$svc"]=$(_get_service_state_parallel "$svc" | sed "s/\x1b\[[0-9;]*m//g")
-                unset PIDS[$pid]
-            fi
-        done
-        # Clear and redraw
-        printf "\033[H\033[2J"  # clear screen
-        printf "%-22s %-12s %-12s\n" "SERVICE" "BEFORE" "AFTER"
-        printf "%-22s %-12s %-12s\n" "----------------------" "---------" "---------"
-        for svc in "${services[@]}"; do
-            local after_color
-            case "${AFTER[$svc]}" in
-                running) after_color="${CLR_GREEN}running${CLR_RESET}" ;;
-                stopped) after_color="${CLR_RED}stopped${CLR_RESET}" ;;
-                down) after_color="${CLR_YELLOW}down${CLR_RESET}" ;;
-                *) after_color="${AFTER[$svc]}" ;;
-            esac
-            printf "%-22s %-12s %-12b\n" "$svc" "${BEFORE[$svc]}" "$after_color"
-        done
-        sleep 0.3
+    for pid in "${!results[@]}"; do
+        wait "$pid"
+        exit_code=$?
+        svc="${results[$pid]}"
+        if [ "$exit_code" -eq 0 ]; then
+            echo -e "[${CLR_GREEN}$svc${CLR_RESET}] ✅ success"
+        else
+            echo -e "[${CLR_RED}$svc${CLR_RESET}] ❌ failed (exit $exit_code)"
+        fi
     done
 }
 
 # ------------------------------
-# Persistent alias
+# Alias management
 # ------------------------------
 _ds_alias_persistent() {
     local action="$1"
@@ -142,9 +129,9 @@ _ds_alias_persistent() {
     touch "$alias_file"
     case "$action" in
         off)
-            local existing
-            existing=$(grep -E '^alias .*?=dsctl$' "$alias_file" | awk -F'=' '{print $1}' | sed 's/alias //')
-            [ -n "$existing" ] && sed -i "/^alias $existing=.*$/d" "$alias_file" && unalias "$existing" 2>/dev/null && echo "Alias removed: $existing" || echo "No alias found."
+            sed -i "/^alias .*?=dsctl$/d" "$alias_file"
+            unalias $(grep -E '^alias .*?=dsctl$' "$alias_file" | awk -F= '{print $1}' | sed 's/alias //') 2>/dev/null
+            echo "Alias removed"
             ;;
         status)
             grep -E '^alias .*?=dsctl$' "$alias_file" || echo "No persistent alias set."
@@ -160,7 +147,7 @@ _ds_alias_persistent() {
 }
 
 # ------------------------------
-# Autocomplete (bash + zsh)
+# Autocomplete
 # ------------------------------
 _dsctl_completion() {
     local cur="${COMP_WORDS[COMP_CWORD]}"
@@ -238,21 +225,15 @@ dsctl() {
         list)
             local services=($(_list_services))
             declare -A STATE
-            # parallel
+            # Parallel safe & clean (no background job messages)
             for svc in "${services[@]}"; do
-                _get_service_state_parallel "$svc" &
-                STATE["$svc"]=$!
-            done
-            # wait and collect
-            for svc in "${services[@]}"; do
-                wait "${STATE[$svc]}"
-                STATE["$svc"]=$(_get_service_state_parallel "$svc")
+                STATE["$svc"]=$(_get_service_state_parallel "$svc")  # simple sequential
             done
 
             printf "\n%-22s %-12s\n" "SERVICE" "STATE"
             printf "%-22s %-12s\n" "----------------------" "------------"
             for svc in "${services[@]}"; do
-                printf "%-22s %-12b\n" "$svc" "${STATE[$svc]}"
+                printf "%-22s %-12b\n" "$svc" "$(_colorize_state "${STATE[$svc]}")"
             done
             echo ""
             return
@@ -270,34 +251,23 @@ dsctl() {
 
     [ "$target" = "all" ] || [ "$target" = "a" ] && services=$(_list_services) || services="$target"
 
-    # ------------------------------
-    # All-stack actions with live table
-    # ------------------------------
+    # All-stack actions
     if _in_list "$action" up down reload update && ([ "$target" = "all" ] || [ "$target" = "a" ]); then
-        case "$action" in
-            up) _run_parallel_live "_dc_up" $services ;;
-            down) _run_parallel_live "_dc_down" $services ;;
-            reload) _run_parallel_live "_dc_reload" $services ;;
-            update) _run_parallel_live "_dc_update" $services ;;
-        esac
+        for svc in $services; do
+            _dc_exec "$svc" "$action"
+        done
         return
     fi
 
-    # ------------------------------
     # Single service actions
-    # ------------------------------
     case "$action" in
-        up) _run_parallel "_dc_up" $services ;;
-        down) _run_parallel "_dc_down" $services ;;
-        reload) _run_parallel "_dc_reload" $services ;;
-        update) _run_parallel "_dc_update" $services ;;
+        up|down|reload|update) _dc_exec "$target" "$action" ;;
         edit) $EDITOR "$SERVICES_DIR/$target/$COMPOSE_FILE" ;;
         env) $EDITOR "$SERVICES_DIR/$target/.env" ;;
         cd) cd "$SERVICES_DIR/$target" || return ;;
         ls) ls -lah "$SERVICES_DIR/$target" ;;
         new) mkdir -p "$SERVICES_DIR/$target" && $EDITOR "$SERVICES_DIR/$target/$COMPOSE_FILE" ;;
         del)
-            [ "$target" = "ALL" ] && { echo "del is single-target only"; return; }
             [ ! -d "$SERVICES_DIR/$target" ] && { echo "Service '$target' not found."; return; }
             echo -e "${CLR_RED}⚠ WARNING:${CLR_RESET} This will permanently delete: $SERVICES_DIR/$target"
             read -r -p "Type '$target' to confirm deletion: " confirm
